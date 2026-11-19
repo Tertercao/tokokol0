@@ -1,6 +1,6 @@
 const c=require('crypto'),E=process.env,b=s=>Buffer.from(s).toString('base64url');
-const T={Stores:['id','name'],Users:['id','store','username','hash','role','name'],Products:['id','store','name','category','price','cost','stock'],Sales:['id','store','date','user','items','total','method']};
-const N=['price','cost','stock','total'];
+const T={Stores:['id','name'],Users:['id','store','username','hash','role','name'],Products:['id','store','name','category','price','cost','stock','barcode'],Sales:['id','store','date','user','items','total','method','discount','tax','status']};
+const N=['price','cost','stock','total','discount','tax'],FL={};
 let tk,ex=0;
 async function gt(){if(Date.now()<ex)return tk;const n=Math.floor(Date.now()/1e3),h=b(JSON.stringify({alg:'RS256',typ:'JWT'})),p=b(JSON.stringify({iss:E.GOOGLE_EMAIL,scope:'https://www.googleapis.com/auth/spreadsheets',aud:'https://oauth2.googleapis.com/token',iat:n,exp:n+3600})),s=c.sign('RSA-SHA256',Buffer.from(h+'.'+p),(E.GOOGLE_KEY||'').replace(/\\n/g,'\n')).toString('base64url');
 const r=await(await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion='+h+'.'+p+'.'+s})).json();
@@ -29,13 +29,16 @@ if(a==='setup'){
  if(!(await all('Users')).length){await add('Stores',{id:'s1',name:'Toko Utama'});await add('Users',{id:'u1',store:'s1',username:d.username,hash:hs(d.password),role:'superadmin',name:'Superadmin'})}
  return out(200,{msg:'Setup selesai. Silakan masuk.'})}
 if(a==='login'){
+ const k=String(d.username||'').trim().toLowerCase(),f=FL[k]&&Date.now()-FL[k].t<6e5?FL[k]:{n:0,t:0};if(f.n>=5)bad('Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi.');
  const x=(await all('Users')).find(u=>u.username===String(d.username||'').trim()&&u.hash===hs(d.password||'',u.hash.split(':')[0]));
- if(!x)bad('Username atau password salah');
+ if(!x){FL[k]={n:f.n+1,t:Date.now()};bad('Username atau password salah')}
+ delete FL[k];
  const st=(await all('Stores')).find(s=>s.id===x.store)||{};
  return out(200,{token:tok({id:x.id,store:x.store,role:x.role,name:x.name}),me:{name:x.name,role:x.role,store:x.store,storeName:st.name}})}
 const u=ver((e.headers.authorization||'').slice(7));if(!u)bad('Sesi habis, silakan masuk lagi');
 const sa=u.role==='superadmin',adm=u.role!=='user',sid=sa&&d.store?d.store:u.store,need=ok=>{if(!ok)bad('Tidak punya akses')},t=d.t;
 
+if(a==='chpw'){const x=(await all('Users')).find(r=>r.id===u.id);if(!x||x.hash!==hs(d.old||'',x.hash.split(':')[0]))bad('Password lama salah');if(String(d.nw||'').length<6)bad('Password baru minimal 6 karakter');await put('Users',{...x,hash:hs(d.nw)});return out(200,{})}
 if(a==='list'){
  need(['Products','Stores'].includes(t)||(t==='Users'&&adm));
  let r=await all(t);r=t==='Stores'?(sa?r:r.filter(s=>s.id===u.store)):r.filter(x=>x.store===sid);
@@ -60,10 +63,13 @@ if(a==='save'||a==='del'){
 if(a==='sale'){
  const ps=(await all('Products')).filter(p=>p.store===sid),items=[];
  if(!Array.isArray(d.items)||!d.items.length)bad('Keranjang kosong');
- for(const it of d.items){const q=parseInt(it.q),p=ps.find(x=>x.id===it.id);if(!p||!(q>0))bad('Item tidak valid');if(+p.stock<q)bad('Stok kurang: '+p.name);items.push({n:p.name,q,p:+p.price,c:+p.cost});p.stock=+p.stock-q;await put('Products',p)}
- const total=items.reduce((s,i)=>s+i.p*i.q,0);
- await add('Sales',{id:id(),store:sid,date:new Date().toISOString(),user:u.name,items:JSON.stringify(items),total,method:['Tunai','QRIS','Transfer'].includes(d.method)?d.method:'Tunai'});
- return out(200,{total})}
+ for(const it of d.items){const q=parseInt(it.q),p=ps.find(x=>x.id===it.id);if(!p||!(q>0))bad('Item tidak valid');if(+p.stock<q)bad('Stok kurang: '+p.name);items.push({i:p.id,n:p.name,q,p:+p.price,c:+p.cost});p.stock=+p.stock-q;await put('Products',p)}
+ const sub=items.reduce((s,i)=>s+i.p*i.q,0),ds=Math.min(Math.max(+d.discount||0,0),sub),tx=Math.min(Math.max(+d.tax||0,0),100),total=Math.round((sub-ds)*(1+tx/100));
+ const sale={id:id(),store:sid,date:new Date().toISOString(),user:u.name,items:JSON.stringify(items),total,method:['Tunai','QRIS','Transfer'].includes(d.method)?d.method:'Tunai',discount:ds,tax:tx,status:'ok'};
+ await add('Sales',sale);return out(200,{...sale,items,subtotal:sub})}
+if(a==='void'){need(adm);const s=(await all('Sales')).find(r=>r.id===d.id&&r.store===sid);if(!s)bad('Transaksi tidak ditemukan');if(s.status==='batal')bad('Sudah dibatalkan');
+ const ps=await all('Products');for(const i of JSON.parse(s.items)){const p=ps.find(x=>x.store===sid&&(i.i?x.id===i.i:x.name===i.n));if(p){p.stock=+p.stock+i.q;await put('Products',p)}}
+ await put('Sales',{...s,status:'batal'});return out(200,{})}
 
 if(a==='report'){need(adm);return out(200,(await all('Sales')).filter(s=>s.store===sid).slice(-500))}
 bad('Aksi tidak dikenal')
